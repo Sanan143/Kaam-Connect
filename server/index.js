@@ -15,6 +15,10 @@ const __dirname = path.dirname(__filename);
 
 dotenv.config({ path: path.join(__dirname, '.env') });
 
+// In production, serve the built frontend
+const isProduction = process.env.NODE_ENV === 'production';
+const distPath = path.join(__dirname, '..', 'dist');
+
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_placeholder',
   key_secret: process.env.RAZORPAY_KEY_SECRET || 'placeholder_secret'
@@ -330,7 +334,18 @@ app.post('/api/payments/verify', async (req, res) => {
   }
 });
 
+// Serve built frontend in production
+if (isProduction) {
+  app.use(express.static(distPath));
+  // All non-API routes serve the React app (SPA client-side routing)
+  app.get('*', (req, res) => {
+    if (!req.path.startsWith('/api') && !req.path.startsWith('/health')) {
+      res.sendFile(path.join(distPath, 'index.html'));
+    }
+  });
+}
+
 const PORT = process.env.PORT || 4000;
-httpServer.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server listening on port ${PORT} (${isProduction ? 'production' : 'development'})`);
 });

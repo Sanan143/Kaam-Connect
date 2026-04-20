@@ -8,6 +8,8 @@
     "dev:server": "node server/index.js",
     "dev:all": "start npm run dev:server && npm run dev",
     "build": "vite build",
+    "render-build": "npm install && npm run build && cd server && npm install",
+    "start": "NODE_ENV=production node server/index.js",
     "lint": "eslint .",
     "preview": "vite preview"
   },

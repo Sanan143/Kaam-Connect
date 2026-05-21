@@ -307,7 +307,7 @@ export default function Dashboard() {
       const orderData = await res.json();
       
       if (!orderData.success) {
-        alert('Could not initiate payment');
+        alert('Could not initiate payment: ' + (orderData.error || 'Unknown error'));
         setIsProcessingPayment(false);
         return;
       }

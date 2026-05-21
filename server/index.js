@@ -499,7 +499,7 @@ app.post('/api/payments/create-order', async (req, res) => {
         'x-client-secret': process.env.CASHFREE_SECRET_KEY || 'dummy_secret_key'
       },
       body: JSON.stringify({
-        order_amount: amount,
+        order_amount: parseFloat(amount),
         order_currency: 'INR',
         order_id: `order_${jobId}_${Date.now()}`,
         customer_details: {

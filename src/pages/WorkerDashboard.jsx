@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { MapPin, Power, PowerOff, Star, Clock, IndianRupee, Navigation, Bell, User, Home, Settings, ChevronRight, Wrench } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { MapPin, Power, PowerOff, Star, Clock, IndianRupee, Navigation, Bell, User, Home, Settings, ChevronRight, Wrench, MessageSquare, Send, Check, Phone } from 'lucide-react';
 import { socket } from '../lib/socket';
 import { useAuth } from '../context/AuthContext';
 
@@ -10,6 +10,15 @@ export default function WorkerDashboard() {
   const [location, setLocation] = useState(null);
   const [locationLabel, setLocationLabel] = useState('Detecting…');
   const [jobPings, setJobPings] = useState([]);
+  const [offerAmounts, setOfferAmounts] = useState({});
+  const [activeJob, setActiveJob] = useState(null);
+  const locationWatchRef = useRef(null);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const chatEndRef = useRef(null);
+  
+  const [completedJobs, setCompletedJobs] = useState([]);
   
   const [isEditingProfile, setIsEditingProfile] = useState(false);
   const [profileData, setProfileData] = useState({ 
@@ -53,16 +62,85 @@ export default function WorkerDashboard() {
       setJobPings((prev) => [data, ...prev].slice(0, 20));
     });
 
+    socket.on('job_accepted', async (data) => {
+      setActiveJob({ 
+        ...data, 
+        status: 'accepted',
+        customerName: data.customerName || 'Customer',
+        customerPhone: data.customerPhone || '',
+        customerAddress: data.customerAddress || '',
+        customerLat: data.customerLat,
+        customerLng: data.customerLng
+      });
+      setJobPings([]);
+      socket.emit('join_job_room', data.jobId);
+      
+      try {
+        const res = await fetch(`/api/chat/messages/${data.jobId}`);
+        const json = await res.json();
+        if (json.success) setChatMessages(json.messages);
+      } catch (err) { console.error('Chat error', err); }
+    });
+
+    socket.on('job_status_updated', (data) => {
+      setActiveJob((prev) => prev ? { ...prev, status: data.status } : null);
+      if (data.status === 'completed') {
+        // Stop location tracking
+        if (locationWatchRef.current) {
+          navigator.geolocation.clearWatch(locationWatchRef.current);
+          locationWatchRef.current = null;
+        }
+        setActiveJob(null);
+        setChatOpen(false);
+      }
+    });
+
+    socket.on('receive_message', (data) => {
+      setChatMessages((prev) => [...prev, data]);
+    });
+
     return () => {
       socket.off('job_ping');
+      socket.off('job_accepted');
+      socket.off('job_status_updated');
+      socket.off('receive_message');
     };
   }, []);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages, chatOpen]);
+
+  // Fetch completed jobs for Earnings tab
+  useEffect(() => {
+    if (activeTab === 'earnings') {
+      const labourId = user?.uid || 'worker_1';
+      fetch(`/api/jobs/worker/${labourId}`)
+        .then(res => res.json())
+        .then(json => {
+           if (json.success) setCompletedJobs(json.jobs);
+        })
+        .catch(err => console.error('Failed to fetch jobs:', err));
+    }
+  }, [activeTab, user]);
+
+  const sendChatMessage = (e) => {
+    e.preventDefault();
+    if (!chatInput.trim() || !activeJob) return;
+    socket.emit('send_message', {
+      jobId: activeJob.jobId,
+      senderId: user?.uid || 'worker_1',
+      senderName: profileData.name,
+      textContent: chatInput
+    });
+    setChatInput('');
+  };
 
   const toggleOnline = () => {
     if (!isOnline) {
       // Go online
       socket.emit('labour_online', {
-        id: user?.uid || `worker_${Math.random().toString(36).substring(7)}`,
+        labourId: user?.uid || 'worker_1',
         name: profileData.name || 'Worker',
         role: profileData.profession || 'Professional',
         coords: location || [12.97, 77.59],
@@ -218,130 +296,272 @@ export default function WorkerDashboard() {
               })}
             </div>
 
-            {/* Job Pings */}
+            {/* Job Flow UI */}
             <div style={{ padding: '24px 16px 0' }}>
-              <h3 style={{ fontSize: 16, fontWeight: 800, color: '#111', margin: '0 0 14px' }}>
-                Incoming Job Requests
-              </h3>
-              {jobPings.length === 0 ? (
-                <div
-                  style={{
-                    background: '#fff',
-                    borderRadius: 16,
-                    padding: '32px 20px',
-                    textAlign: 'center',
-                    boxShadow: '0 2px 8px rgba(0,0,0,0.06)',
-                  }}
-                >
-                  <Navigation size={32} color="#ddd" style={{ marginBottom: 12 }} />
-                  <p style={{ color: '#aaa', fontSize: 14, margin: 0 }}>
-                    {isOnline ? 'Waiting for job requests…' : 'Go online to receive jobs'}
-                  </p>
+              {activeJob ? (
+                <div>
+                  <h3 style={{ fontSize: 16, fontWeight: 800, color: '#111', margin: '0 0 14px' }}>
+                    Active Job
+                  </h3>
+                  <div style={{ background: '#fff', borderRadius: 16, padding: '20px', boxShadow: '0 4px 16px rgba(0,0,0,0.08)' }}>
+                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                       <div>
+                         <p style={{ margin: 0, fontSize: 13, color: '#888', fontWeight: 600 }}>Job #{activeJob.jobId}</p>
+                         <h4 style={{ margin: '4px 0 0', fontSize: 18, fontWeight: 800 }}>Assigned Job</h4>
+                       </div>
+                       <button onClick={() => setChatOpen(true)} style={{ position: 'relative', background: '#3b82f6', color: '#fff', border: 'none', borderRadius: '50%', width: 44, height: 44, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', boxShadow: '0 2px 8px rgba(59,130,246,0.4)' }}>
+                         <MessageSquare size={20} />
+                       </button>
+                     </div>
+                     
+                     <div style={{ display: 'flex', gap: 10, background: '#f5f5f5', padding: 12, borderRadius: 12, marginBottom: 20 }}>
+                       <div style={{ flex: 1, textAlign: 'center' }}>
+                         <p style={{ margin: 0, fontSize: 12, color: '#888' }}>Price</p>
+                         <p style={{ margin: '2px 0 0', fontSize: 16, fontWeight: 800, color: '#16a34a' }}>₹{activeJob.amount || '---'}</p>
+                       </div>
+                       <div style={{ width: 1, background: '#ddd' }} />
+                       <div style={{ flex: 1, textAlign: 'center' }}>
+                         <p style={{ margin: 0, fontSize: 12, color: '#888' }}>Status</p>
+                         <p style={{ margin: '2px 0 0', fontSize: 14, fontWeight: 800, color: '#333' }}>
+                           {activeJob.status === 'accepted' ? 'Pending Arrival' : activeJob.status === 'en_route' ? 'En Route' : 'In Progress'}
+                         </p>
+                       </div>
+                     </div>
+                     
+                     {/* Customer Contact Card */}
+                     <div style={{ background: 'linear-gradient(135deg, #f0fdf4, #dcfce7)', borderRadius: 14, padding: 16, marginBottom: 16, border: '1px solid #bbf7d0' }}>
+                       <p style={{ margin: '0 0 8px', fontSize: 12, fontWeight: 700, color: '#16a34a', textTransform: 'uppercase', letterSpacing: 0.5 }}>Customer Details</p>
+                       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10 }}>
+                         <div style={{ width: 42, height: 42, borderRadius: '50%', background: '#16a34a', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontWeight: 800, fontSize: 16, flexShrink: 0 }}>
+                           {(activeJob.customerName || 'C').charAt(0).toUpperCase()}
+                         </div>
+                         <div style={{ flex: 1 }}>
+                           <p style={{ margin: 0, fontSize: 15, fontWeight: 800, color: '#111' }}>{activeJob.customerName || 'Customer'}</p>
+                           {activeJob.customerPhone && (
+                             <p style={{ margin: '2px 0 0', fontSize: 13, color: '#555', fontWeight: 600 }}>{activeJob.customerPhone}</p>
+                           )}
+                         </div>
+                         {activeJob.customerPhone && (
+                           <a href={`tel:${activeJob.customerPhone}`} style={{ background: '#16a34a', color: '#fff', border: 'none', borderRadius: '50%', width: 40, height: 40, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', boxShadow: '0 2px 8px rgba(34,197,94,0.3)', textDecoration: 'none' }}>
+                             <Phone size={18} />
+                           </a>
+                         )}
+                       </div>
+                       {activeJob.customerAddress && (
+                         <div style={{ background: '#fff', borderRadius: 10, padding: '10px 12px', display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                           <MapPin size={16} color="#16a34a" style={{ marginTop: 2, flexShrink: 0 }} />
+                           <div>
+                             <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: '#333', lineHeight: 1.4 }}>{activeJob.customerAddress}</p>
+                             {activeJob.customerLat && activeJob.customerLng && (
+                               <a 
+                                 href={`https://www.google.com/maps/dir/?api=1&destination=${activeJob.customerLat},${activeJob.customerLng}`}
+                                 target="_blank" 
+                                 rel="noopener noreferrer"
+                                 style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginTop: 6, fontSize: 12, fontWeight: 700, color: '#3b82f6', textDecoration: 'none' }}
+                               >
+                                 <Navigation size={12} /> Open in Google Maps
+                               </a>
+                             )}
+                           </div>
+                         </div>
+                       )}
+                     </div>
+
+                     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                       {activeJob.status === 'accepted' && (
+                         <button onClick={() => {
+                           socket.emit('update_job_status', { ...activeJob, status: 'en_route', labourId: user?.uid });
+                           // Start sending live location pings to customer
+                           const watchId = navigator.geolocation.watchPosition(
+                             (pos) => {
+                               socket.emit('worker_location_ping', {
+                                 jobId: activeJob.jobId,
+                                 labourId: user?.uid || 'worker_1',
+                                 lat: pos.coords.latitude,
+                                 lng: pos.coords.longitude,
+                                 customerId: activeJob.customerId
+                               });
+                             },
+                             null,
+                             { enableHighAccuracy: true, maximumAge: 5000 }
+                           );
+                           locationWatchRef.current = watchId;
+                           // Open Google Maps navigation
+                           if (activeJob.customerLat && activeJob.customerLng) {
+                             window.open(`https://www.google.com/maps/dir/?api=1&destination=${activeJob.customerLat},${activeJob.customerLng}&travelmode=driving`, '_blank');
+                           }
+                         }} style={{ width: '100%', background: 'linear-gradient(130deg, #3b82f6, #2563eb)', color: '#fff', border: 'none', padding: 14, borderRadius: 12, fontWeight: 800, fontSize: 15, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, boxShadow: '0 4px 12px rgba(59,130,246,0.3)' }}>
+                           <Navigation size={18} /> Start Navigation To Customer
+                         </button>
+                       )}
+                       {activeJob.status === 'en_route' && (
+                         <button onClick={() => {
+                           socket.emit('update_job_status', { ...activeJob, status: 'in_progress', labourId: user?.uid });
+                           // Stop location tracking when arrived
+                           if (locationWatchRef.current) {
+                             navigator.geolocation.clearWatch(locationWatchRef.current);
+                             locationWatchRef.current = null;
+                           }
+                         }} style={{ width: '100%', background: 'linear-gradient(130deg, #f59e0b, #d97706)', color: '#fff', border: 'none', padding: 14, borderRadius: 12, fontWeight: 800, fontSize: 15, cursor: 'pointer', boxShadow: '0 4px 12px rgba(245,158,11,0.3)' }}>
+                           ✅ I Have Arrived - Start Work
+                         </button>
+                       )}
+                       {activeJob.status === 'in_progress' && (
+                         <button onClick={() => socket.emit('update_job_status', { ...activeJob, status: 'completed', labourId: user?.uid })} style={{ width: '100%', background: 'linear-gradient(130deg, #16a34a, #15803d)', color: '#fff', border: 'none', padding: 14, borderRadius: 12, fontWeight: 800, fontSize: 15, cursor: 'pointer', boxShadow: '0 4px 12px rgba(34,197,94,0.3)' }}>
+                           🎉 Complete Job & Request Payment
+                         </button>
+                       )}
+                     </div>
+                  </div>
                 </div>
               ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                  {jobPings.map((job, i) => (
+                <>
+                  <h3 style={{ fontSize: 16, fontWeight: 800, color: '#111', margin: '0 0 14px' }}>
+                    Incoming Job Requests
+                  </h3>
+                  {jobPings.length === 0 ? (
                     <div
-                      key={i}
                       style={{
                         background: '#fff',
                         borderRadius: 16,
-                        padding: '16px',
+                        padding: '32px 20px',
+                        textAlign: 'center',
                         boxShadow: '0 2px 8px rgba(0,0,0,0.06)',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: 12
                       }}
                     >
-                      <div style={{ display: 'flex', gap: 12 }}>
-                        {job.photoUrl ? (
-                          <img src={job.photoUrl} alt="Job" style={{ width: 64, height: 64, borderRadius: 12, objectFit: 'cover', background: '#f5f5f5' }} />
-                        ) : (
-                          <div style={{ width: 64, height: 64, borderRadius: 12, background: '#f0fdf4', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                            <Wrench size={24} color="#16a34a" />
-                          </div>
-                        )}
-                        <div style={{ flex: 1 }}>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                            <div>
-                              <p style={{ margin: 0, fontWeight: 800, fontSize: 16, color: '#111' }}>
-                                {job.category || 'General Work'}
-                              </p>
-                              <p style={{ margin: '2px 0 0', fontSize: 12, color: '#888', fontWeight: 600 }}>
-                                Job #{job.jobId || i + 1}
-                              </p>
-                            </div>
-                            <div style={{ textAlign: 'right' }}>
-                              <p style={{ margin: 0, fontWeight: 800, color: '#16a34a', fontSize: 16 }}>
-                                ₹{job.amount || 'N/A'}
-                              </p>
-                              <p style={{ margin: '2px 0 0', fontSize: 11, color: '#666', background: '#f5f5f5', padding: '2px 6px', borderRadius: 6, display: 'inline-block' }}>
-                                {job.paymentType === 'lump_sum' ? 'Lump Sum' : 'Per Hour'}
-                              </p>
-                            </div>
-                          </div>
-                          {job.duration && (
-                            <p style={{ margin: '6px 0 0', fontSize: 12, color: '#555', display: 'flex', alignItems: 'center', gap: 4 }}>
-                              <Clock size={12} /> {job.duration}
-                            </p>
-                          )}
-                        </div>
-                      </div>
-                      
-                      {job.description && (
-                        <div style={{ background: '#fafafa', padding: 10, borderRadius: 8, fontSize: 13, color: '#444', lineHeight: 1.4, border: '1px solid #eee' }}>
-                          <span style={{ fontWeight: 700, color: '#333', display: 'block', marginBottom: 4 }}>Description:</span>
-                          {job.description}
-                        </div>
-                      )}
-
-                      <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-                        <button
-                          onClick={() => setJobPings((prev) => prev.filter((_, idx) => idx !== i))}
-                          style={{
-                            flex: 1,
-                            background: '#fff',
-                            color: '#555',
-                            border: '1px solid #ddd',
-                            borderRadius: 10,
-                            padding: '10px',
-                            fontWeight: 700,
-                            fontSize: 14,
-                            cursor: 'pointer',
-                          }}
-                        >
-                          Decline
-                        </button>
-                        <button
-                          onClick={() => {
-                            socket.emit('accept_job', {
-                              jobId: job.jobId,
-                              labourId: user?.uid || 'worker_1',
-                              customerId: job.customerId,
-                            });
-                            setJobPings((prev) => prev.filter((_, idx) => idx !== i));
-                          }}
-                          style={{
-                            flex: 1,
-                            background: 'linear-gradient(130deg, #16a34a, #22c55e)',
-                            color: '#fff',
-                            border: 'none',
-                            borderRadius: 10,
-                            padding: '10px',
-                            fontWeight: 800,
-                            fontSize: 14,
-                            cursor: 'pointer',
-                            boxShadow: '0 4px 12px rgba(34,197,94,0.3)',
-                          }}
-                        >
-                          Accept Job
-                        </button>
-                      </div>
+                      <Navigation size={32} color="#ddd" style={{ marginBottom: 12 }} />
+                      <p style={{ color: '#aaa', fontSize: 14, margin: 0 }}>
+                        {isOnline ? 'Waiting for job requests…' : 'Go online to receive jobs'}
+                      </p>
                     </div>
-                  ))}
-                </div>
+                  ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                      {jobPings.map((job, i) => (
+                        <div
+                          key={i}
+                          style={{
+                            background: '#fff',
+                            borderRadius: 16,
+                            padding: '16px',
+                            boxShadow: '0 2px 8px rgba(0,0,0,0.06)',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: 12
+                          }}
+                        >
+                          <div style={{ display: 'flex', gap: 12 }}>
+                            {job.photoUrl ? (
+                              <img src={job.photoUrl} alt="Job" style={{ width: 64, height: 64, borderRadius: 12, objectFit: 'cover', background: '#f5f5f5' }} />
+                            ) : (
+                              <div style={{ width: 64, height: 64, borderRadius: 12, background: '#f0fdf4', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                <Wrench size={24} color="#16a34a" />
+                              </div>
+                            )}
+                            <div style={{ flex: 1 }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                                <div>
+                                  <p style={{ margin: 0, fontWeight: 800, fontSize: 16, color: '#111' }}>{job.category || 'General Work'}</p>
+                                  <p style={{ margin: '2px 0 0', fontSize: 12, color: '#888', fontWeight: 600 }}>Job #{job.jobId || i + 1}</p>
+                                </div>
+                                <div style={{ textAlign: 'right' }}>
+                                  <p style={{ margin: 0, fontWeight: 800, color: '#888', fontSize: 13, textDecoration: 'line-through' }}>
+                                    ₹{job.amount || 'N/A'}
+                                  </p>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                          
+                          {/* Negotiation Controls */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#f0fdf4', border: '1px solid #bbf7d0', padding: 8, borderRadius: 8 }}>
+                            <span style={{ fontSize: 13, fontWeight: 700, color: '#16a34a' }}>Your Price: ₹</span>
+                            <input 
+                               type="number" 
+                               placeholder={job.amount}
+                               value={offerAmounts[job.jobId] !== undefined ? offerAmounts[job.jobId] : job.amount}
+                               onChange={(e) => setOfferAmounts(p => ({...p, [job.jobId]: e.target.value}))}
+                               style={{ flex: 1, border: 'none', background: 'transparent', outline: 'none', fontSize: 14, fontWeight: 800, color: '#111' }}
+                            />
+                          </div>
+
+                          <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                            <button
+                              onClick={() => setJobPings((prev) => prev.filter((_, idx) => idx !== i))}
+                              style={{ flex: 1, background: '#fff', color: '#555', border: '1px solid #ddd', borderRadius: 10, padding: '10px', fontWeight: 700, fontSize: 14, cursor: 'pointer' }}
+                            >
+                              Decline
+                            </button>
+                            <button
+                              onClick={() => {
+                                const finalAmount = offerAmounts[job.jobId] || job.amount;
+                                socket.emit('counter_offer', {
+                                  ...job,
+                                  amount: finalAmount,
+                                  labourId: user?.uid || 'worker_1',
+                                  labourName: profileData.name,
+                                  labourPhone: profileData.phone,
+                                  rating: 4.8
+                                });
+                                // Optimistically remove
+                                setJobPings((prev) => prev.filter((_, idx) => idx !== i));
+                                alert(`Offer of ₹${finalAmount} sent to customer!`);
+                              }}
+                              style={{ flex: 2, background: 'linear-gradient(130deg, #16a34a, #22c55e)', color: '#fff', border: 'none', borderRadius: 10, padding: '10px', fontWeight: 800, fontSize: 14, cursor: 'pointer', boxShadow: '0 4px 12px rgba(34,197,94,0.3)' }}
+                            >
+                              Send Offer
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
               )}
             </div>
+
+      {/* Chat Mobile Overlay */}
+      {chatOpen && activeJob && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 999, background: '#fff', display: 'flex', flexDirection: 'column' }}>
+          <header style={{ background: '#111', color: '#fff', padding: '16px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'sticky', top: 0 }}>
+            <div>
+              <p style={{ margin: 0, fontSize: 12, color: '#aaa', fontWeight: 600 }}>Chat with Customer</p>
+              <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800 }}>Job #{activeJob.jobId}</h3>
+            </div>
+            <button onClick={() => setChatOpen(false)} style={{ background: '#333', border: 'none', color: '#fff', padding: '6px 12px', borderRadius: 20, fontSize: 12, fontWeight: 700 }}>Close</button>
+          </header>
+          
+          <div style={{ flex: 1, overflowY: 'auto', padding: 16, background: '#f5f5f5', display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ textAlign: 'center', marginBottom: 10 }}>
+              <span style={{ fontSize: 11, background: '#ddd', padding: '2px 8px', borderRadius: 10, color: '#555' }}>Chat secured for 24 hours</span>
+            </div>
+            {chatMessages.map((msg, i) => {
+              const isMine = msg.senderId === (user?.uid || 'worker_1');
+              return (
+                <div key={i} style={{ alignSelf: isMine ? 'flex-end' : 'flex-start', maxWidth: '80%' }}>
+                  {!isMine && <span style={{ fontSize: 10, color: '#888', marginLeft: 4 }}>Customer</span>}
+                  <div style={{ background: isMine ? '#16a34a' : '#fff', color: isMine ? '#fff' : '#111', padding: '10px 14px', borderRadius: 16, borderBottomRightRadius: isMine ? 4 : 16, borderBottomLeftRadius: isMine ? 16 : 4, boxShadow: '0 1px 4px rgba(0,0,0,0.1)', fontSize: 14 }}>
+                    {msg.textContent}
+                  </div>
+                </div>
+              );
+            })}
+            <div ref={chatEndRef} />
+          </div>
+
+          <form onSubmit={sendChatMessage} style={{ padding: 12, background: '#fff', borderTop: '1px solid #eee', display: 'flex', gap: 8 }}>
+            <input 
+               type="text" 
+               placeholder="Type a message..." 
+               value={chatInput}
+               onChange={e => setChatInput(e.target.value)}
+               style={{ flex: 1, border: '1px solid #ddd', borderRadius: 24, padding: '12px 16px', fontSize: 14, outline: 'none' }}
+            />
+            <button type="submit" style={{ background: '#16a34a', color: '#fff', border: 'none', width: 44, height: 44, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+              <Send size={18} />
+            </button>
+          </form>
+        </div>
+      )}
           </>
         )}
 
@@ -350,28 +570,36 @@ export default function WorkerDashboard() {
             <h2 style={{ fontSize: 24, fontWeight: 800, color: '#111', margin: '0 0 20px' }}>Your Earnings</h2>
             <div style={{ background: 'linear-gradient(130deg, #16a34a, #22c55e)', borderRadius: 20, padding: '24px', color: '#fff', boxShadow: '0 4px 12px rgba(34,197,94,0.3)', marginBottom: 24 }}>
               <p style={{ margin: '0 0 8px', fontSize: 14, opacity: 0.9, fontWeight: 600 }}>Total Balance</p>
-              <h3 style={{ margin: 0, fontSize: 36, fontWeight: 800 }}>₹1,240</h3>
+              <h3 style={{ margin: 0, fontSize: 36, fontWeight: 800 }}>₹{completedJobs.reduce((acc, job) => acc + (parseFloat(job.amount) || 0), 0)}</h3>
               <button style={{ marginTop: 16, background: '#fff', color: '#16a34a', border: 'none', borderRadius: 10, padding: '8px 16px', fontWeight: 700, cursor: 'pointer' }}>
                 Withdraw Funds
               </button>
             </div>
             <h3 style={{ fontSize: 18, fontWeight: 800, color: '#111', margin: '0 0 16px' }}>Recent Transactions</h3>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              {[1,2,3].map((item) => (
-                <div key={item} style={{ background: '#fff', borderRadius: 16, padding: '16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                    <div style={{ width: 40, height: 40, borderRadius: 12, background: '#f0fdf4', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <IndianRupee size={20} color="#16a34a" />
+            {completedJobs.length === 0 ? (
+              <p style={{ color: '#666', textAlign: 'center', marginTop: 32 }}>No completed jobs yet.</p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {completedJobs.map((job) => (
+                  <div key={job.id} style={{ background: '#fff', borderRadius: 16, padding: '16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <div style={{ width: 40, height: 40, borderRadius: 12, background: '#f0fdf4', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <IndianRupee size={20} color="#16a34a" />
+                      </div>
+                      <div>
+                        <p style={{ margin: 0, fontWeight: 700, fontSize: 15, color: '#111' }}>Payment Received</p>
+                        <p style={{ margin: '2px 0 0', fontSize: 12, color: '#888' }}>{job.category} • {new Date(job.created_at).toLocaleDateString()}</p>
+                        {job.platformFee > 0 && <p style={{ margin: '2px 0 0', fontSize: 11, color: '#dc2626' }}>6% Fee: -₹{job.platformFee}</p>}
+                      </div>
                     </div>
-                    <div>
-                      <p style={{ margin: 0, fontWeight: 700, fontSize: 15, color: '#111' }}>Payment Received</p>
-                      <p style={{ margin: '2px 0 0', fontSize: 12, color: '#888' }}>Job #{120 + item} • Plumber</p>
+                    <div style={{ textAlign: 'right' }}>
+                      <span style={{ display: 'block', fontWeight: 800, color: '#16a34a' }}>+₹{job.amount || '0'}</span>
+                      {job.grossAmount && <span style={{ fontSize: 11, color: '#999', textDecoration: 'line-through' }}>₹{job.grossAmount}</span>}
                     </div>
                   </div>
-                  <span style={{ fontWeight: 800, color: '#16a34a' }}>+₹{item === 1 ? '400' : '350'}</span>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

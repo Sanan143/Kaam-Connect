@@ -4,7 +4,6 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
-import Razorpay from 'razorpay';
 import bcrypt from 'bcryptjs';
 import admin from 'firebase-admin';
 import path from 'path';
@@ -18,11 +17,6 @@ dotenv.config({ path: path.join(__dirname, '.env') });
 // In production, serve the built frontend
 const isProduction = process.env.NODE_ENV === 'production';
 const distPath = path.join(__dirname, '..', 'dist');
-
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_placeholder',
-  key_secret: process.env.RAZORPAY_KEY_SECRET || 'placeholder_secret'
-});
 
 const app = express();
 const httpServer = createServer(app);
@@ -40,6 +34,9 @@ const activeLabours = new Map();
 
 // Memory store for Mock Auth
 const mockAuthDB = new Map();
+
+// Memory store for jobs (fallback if Supabase fails or if using mock IDs)
+const memoryJobs = new Map();
 
 app.use(cors());
 app.use(express.json());
@@ -221,6 +218,91 @@ app.get('/api/labour/search', async (req, res) => {
   }
 });
 
+// Chat Messages history endpoint (Last 24h)
+app.get('/api/chat/messages/:jobId', async (req, res) => {
+  try {
+    if (isBackendMockMode) return res.status(200).json({ success: true, messages: [] });
+    // Fetch messages only from last 24 hours
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('job_id', req.params.jobId)
+      .gte('created_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
+      .order('created_at', { ascending: true });
+      
+    if (error) throw error;
+    res.status(200).json({ success: true, messages: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Submit Review Endpoint
+app.post('/api/jobs/:jobId/review', async (req, res) => {
+  const { rating, review, labourId } = req.body;
+  if (!rating || !labourId) return res.status(400).json({ error: 'Rating and labourId required' });
+  
+  try {
+    if (isBackendMockMode) return res.status(200).json({ success: true });
+    
+    // 1. Update Job with rating and review
+    await supabase.from('jobs').update({ rating, review }).eq('id', req.params.jobId);
+    
+    // 2. Fetch all completed jobs for this worker to recalculate rating
+    const { data: jobs } = await supabase.from('jobs').select('rating').eq('labour_id', labourId).not('rating', 'is', null);
+    
+    // 3. Update Labour Profile average rating
+    if (jobs && jobs.length > 0) {
+      const avg = jobs.reduce((acc, curr) => acc + curr.rating, 0) / jobs.length;
+      await supabase.from('labour_profiles').update({ 
+        average_rating: avg.toFixed(2),
+        completed_jobs: jobs.length 
+      }).eq('user_id', labourId);
+    }
+    
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Worker Job History Endpoint
+app.get('/api/jobs/worker/:labourId', async (req, res) => {
+  try {
+    const labourId = req.params.labourId;
+    let completedJobs = [];
+    
+    if (!isBackendMockMode) {
+      // Try fetching from real Supabase DB
+      const { data, error } = await supabase
+        .from('jobs')
+        .select('*')
+        .eq('labour_id', labourId)
+        .eq('status', 'completed')
+        .order('created_at', { ascending: false });
+        
+      if (!error && data) {
+         completedJobs = data;
+      }
+    }
+    
+    // Fallback/Merge with memory jobs (for jobs created with mock 'job_' prefix during testing)
+    const memJobs = Array.from(memoryJobs.values()).filter(j => j.labourId === labourId && j.status === 'completed');
+    
+    // Map to a unified format
+    const results = [...completedJobs, ...memJobs].map(job => ({
+       id: job.id || job.jobId,
+       amount: job.amount,
+       category: job.category || 'General Service',
+       created_at: job.created_at || new Date().toISOString()
+    }));
+    
+    res.status(200).json({ success: true, jobs: results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Socket.io Connection Logic
 io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
@@ -261,18 +343,127 @@ io.on('connection', (socket) => {
     });
   });
 
+  socket.on('counter_offer', (data) => {
+    // Worker proposes a different price — include worker phone for later acceptance
+    io.to(`customer_${data.customerId}`).emit('receive_offer', {
+      jobId: data.jobId,
+      labourId: data.labourId,
+      labourName: data.labourName,
+      labourPhone: data.labourPhone || '',
+      proposedAmount: data.amount,
+      rating: data.rating
+    });
+  });
+
+  socket.on('accept_offer', async (data) => {
+    // Customer accepted an offer from a specific labour
+    // Send customer details to worker so they can navigate
+    io.to(`labour_${data.labourId}`).emit('job_accepted', {
+      jobId: data.jobId,
+      customerId: data.customerId,
+      amount: data.proposedAmount || data.amount,
+      customerName: data.customerName || 'Customer',
+      customerPhone: data.customerPhone || '',
+      customerAddress: data.customerAddress || '',
+      customerLat: data.customerLat,
+      customerLng: data.customerLng
+    });
+
+    // Send worker details back to customer so they can track
+    io.to(`customer_${data.customerId}`).emit('job_accepted', {
+      jobId: data.jobId,
+      labourId: data.labourId,
+      labourName: data.labourName || 'Worker',
+      labourPhone: data.labourPhone || '',
+      amount: data.proposedAmount || data.amount
+    });
+    
+    memoryJobs.set(data.jobId, { ...data, status: 'accepted', amount: data.proposedAmount || data.amount });
+    
+    // For DB, we would update job status to 'accepted' and set labour_id.
+    if (!isBackendMockMode && data.jobId && !data.jobId.startsWith('job_')) {
+      try {
+        await supabase.from('jobs').update({ status: 'accepted', labour_id: data.labourId }).eq('id', data.jobId);
+      } catch (err) {}
+    }
+  });
+
   socket.on('accept_job', async (data) => {
-    // Labour accepts job
+    // Labour accepts job at original proposed price directly
     io.to(`customer_${data.customerId}`).emit('job_accepted', {
       jobId: data.jobId,
       labourId: data.labourId
     });
+    io.to(`labour_${data.labourId}`).emit('job_accepted', {
+      jobId: data.jobId,
+      customerId: data.customerId
+    });
+    
+    // Save to memory store
+    memoryJobs.set(data.jobId, { ...data, status: 'accepted' });
+  });
+
+  socket.on('update_job_status', async (data) => {
+    // Transitions: en_route -> in_progress -> completed
+    if (data.customerId) io.to(`customer_${data.customerId}`).emit('job_status_updated', data);
+    if (data.labourId) io.to(`labour_${data.labourId}`).emit('job_status_updated', data);
+    
+    // Update memory store
+    if (memoryJobs.has(data.jobId)) {
+       const job = memoryJobs.get(data.jobId);
+       memoryJobs.set(data.jobId, { ...job, ...data, status: data.status });
+    } else {
+       memoryJobs.set(data.jobId, { ...data, status: data.status });
+    }
+    
+    if (!isBackendMockMode && data.jobId && !data.jobId.startsWith('job_')) {
+      try {
+        await supabase.from('jobs').update({ status: data.status }).eq('id', data.jobId);
+      } catch (err) {}
+    }
+  });
+
+  socket.on('join_job_room', (jobId) => {
+    socket.join(`job_${jobId}`);
+  });
+
+  socket.on('send_message', async (data) => {
+    // data => { jobId, senderId, textContent, senderName }
+    const messagePayload = {
+      ...data,
+      created_at: new Date().toISOString()
+    };
+    
+    io.to(`job_${data.jobId}`).emit('receive_message', messagePayload);
+    
+    if (!isBackendMockMode && data.jobId && !data.jobId.startsWith('job_')) {
+      try {
+        await supabase.from('messages').insert([{
+          job_id: data.jobId,
+          sender_id: data.senderId,
+          text_content: data.textContent
+        }]);
+      } catch(e) { console.error('Chat save err', e)}
+    }
   });
 
   // Deprecated in favor of the full `active_labours_updated` broadcast array
   socket.on('update_location', (data) => {
     if (data.customerId) {
         io.to(`customer_${data.customerId}`).emit('labour_location_update', data);
+    }
+  });
+
+  // Real-time worker location tracking during active jobs
+  socket.on('worker_location_ping', (data) => {
+    // data => { jobId, labourId, lat, lng, customerId }
+    if (data.customerId) {
+      io.to(`customer_${data.customerId}`).emit('worker_location_update', {
+        jobId: data.jobId,
+        labourId: data.labourId,
+        lat: data.lat,
+        lng: data.lng
+      });
     }
   });
 
@@ -291,46 +482,98 @@ io.on('connection', (socket) => {
   });
 });
 
-// Razorpay Order Creation
+// Cashfree Order Creation
 app.post('/api/payments/create-order', async (req, res) => {
   const { amount, jobId } = req.body;
   if (!amount || !jobId) return res.status(400).json({ error: 'Missing parameters' });
 
   try {
+    const url = 'https://sandbox.cashfree.com/pg/orders';
     const options = {
-      amount: Math.round(amount * 100), // convert to paise
-      currency: "INR",
-      receipt: `receipt_job_${jobId}`,
-      payment_capture: 1
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'x-api-version': '2023-08-01',
+        'x-client-id': process.env.CASHFREE_APP_ID || 'dummy_app_id',
+        'x-client-secret': process.env.CASHFREE_SECRET_KEY || 'dummy_secret_key'
+      },
+      body: JSON.stringify({
+        order_amount: amount,
+        order_currency: 'INR',
+        order_id: `order_${jobId}_${Date.now()}`,
+        customer_details: {
+          customer_id: 'cust_01',
+          customer_phone: '9999999999'
+        }
+      })
     };
-
-    const order = await razorpay.orders.create(options);
-    res.status(200).json({ success: true, order });
+    
+    const response = await fetch(url, options);
+    const data = await response.json();
+    
+    if (data.payment_session_id) {
+       res.status(200).json({ success: true, payment_session_id: data.payment_session_id, order_id: data.order_id });
+    } else {
+       res.status(400).json({ success: false, error: data.message || 'Failed to create order' });
+    }
   } catch (error) {
-    console.error('Error creating order:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Razorpay Webhook Verification
-import crypto from 'crypto';
+// Cashfree Payment Verification
 app.post('/api/payments/verify', async (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, jobId } = req.body;
+  const { order_id } = req.body;
 
-  const sign = razorpay_order_id + "|" + razorpay_payment_id;
-  const expectedSign = crypto
-    .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-    .update(sign.toString())
-    .digest("hex");
+  try {
+    const url = `https://sandbox.cashfree.com/pg/orders/${order_id}`;
+    const options = {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'x-api-version': '2023-08-01',
+        'x-client-id': process.env.CASHFREE_APP_ID || 'dummy_app_id',
+        'x-client-secret': process.env.CASHFREE_SECRET_KEY || 'dummy_secret_key'
+      }
+    };
 
-  if (razorpay_signature === expectedSign) {
-    // Payment is verified
-    // 1. Update job status
-    // 2. Add transaction record
-    // 3. Update labour wallet
-    res.status(200).json({ success: true, message: 'Payment verified successfully' });
-  } else {
-    res.status(400).json({ success: false, message: 'Invalid signature' });
+    const response = await fetch(url, options);
+    const data = await response.json();
+    
+    // In Sandbox, if dummy keys are used, data might not have order_status
+    // We will simulate success if order_status is PAID, or if we are using dummy keys (for MVP demo)
+    if (data.order_status === 'PAID' || process.env.CASHFREE_APP_ID === undefined) {
+       
+       // Process 6% Platform Fee Deduction
+       try {
+         const parts = order_id.split('_');
+         if (parts.length >= 3) {
+           const jobId = parts.slice(1, -1).join('_');
+           let originalAmount = 0;
+           
+           if (memoryJobs.has(jobId)) {
+             const job = memoryJobs.get(jobId);
+             originalAmount = parseFloat(job.amount) || 0;
+             const netAmount = Math.floor(originalAmount * 0.94); // 6% deduction
+             
+             // Update memory store
+             memoryJobs.set(jobId, { ...job, amount: netAmount, grossAmount: originalAmount, platformFee: originalAmount - netAmount });
+             
+             // Update Supabase if real DB
+             if (!isBackendMockMode && jobId && !jobId.startsWith('job_')) {
+               await supabase.from('jobs').update({ amount: netAmount }).eq('id', jobId);
+             }
+           }
+         }
+       } catch (err) { console.error('Fee deduction error:', err) }
+
+       res.status(200).json({ success: true, message: 'Payment verified successfully' });
+    } else {
+       res.status(400).json({ success: false, message: 'Payment not successful' });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Verification error' });
   }
 });
 

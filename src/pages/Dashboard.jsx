@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
-import { MapPin, Menu, Search, ShoppingBag, User, Home, Wrench, Zap, PaintBucket, Hammer, Leaf, Truck, Star, ChevronRight, X, Bell, CheckCircle, Upload, ImageIcon } from 'lucide-react';
+import { MapPin, Menu, Search, ShoppingBag, User, Home, Wrench, Zap, PaintBucket, Hammer, Leaf, Truck, Star, ChevronRight, X, Bell, CheckCircle, Upload, ImageIcon, Settings, PowerOff, MessageSquare, Send, Phone, Navigation } from 'lucide-react';
 import { socket } from '../lib/socket';
 import { supabase } from '../lib/supabase';
+import { useAuth } from '../context/AuthContext';
 import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
@@ -77,6 +78,7 @@ const SERVICES = [
 const TABS = ['home', 'orders', 'profile'];
 
 export default function Dashboard() {
+  const { user, logout } = useAuth();
   const [activeTab, setActiveTab] = useState('home');
   const [searchQuery, setSearchQuery] = useState('');
   const [locationLabel, setLocationLabel] = useState('Detecting location…');
@@ -86,7 +88,13 @@ export default function Dashboard() {
   const [liveWorkers, setLiveWorkers] = useState([]);
   
   const [isEditingProfile, setIsEditingProfile] = useState(false);
-  const [profileData, setProfileData] = useState({ name: 'Aman Kumar', phone: '+91 9876543210' });
+  const [profileData, setProfileData] = useState({ 
+    name: user?.user_metadata?.full_name || 'Aman Kumar', 
+    phone: user?.user_metadata?.phone || '+91 9876543210',
+    email: user?.email || 'aman@example.com',
+    address: 'Saket, New Delhi',
+    profilePic: null 
+  });
 
   // Booking Flow States
   const [bookingWorker, setBookingWorker] = useState(null);
@@ -98,6 +106,20 @@ export default function Dashboard() {
   const [bookingPhotoPreview, setBookingPhotoPreview] = useState(null);
   const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
   const [bookingSuccess, setBookingSuccess] = useState(false);
+  
+  const [activeJobRequest, setActiveJobRequest] = useState(null);
+  const [receivedOffers, setReceivedOffers] = useState([]);
+  const [activeJob, setActiveJob] = useState(null);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const chatEndRef = useRef(null);
+  const [reviewModalOpen, setReviewModalOpen] = useState(false);
+  const [reviewRating, setReviewRating] = useState(5);
+  const [reviewText, setReviewText] = useState('');
+  const [workerLocation, setWorkerLocation] = useState(null);
+  const [paymentModalOpen, setPaymentModalOpen] = useState(false);
+  const [isProcessingPayment, setIsProcessingPayment] = useState(false);
 
   const handlePhotoSelect = (e) => {
     if (e.target.files && e.target.files[0]) {
@@ -148,9 +170,9 @@ export default function Dashboard() {
     // Generate a job id
     const jobId = `job_${Math.floor(Math.random() * 10000)}`;
     
-    socket.emit('request_job', {
+    const requestPayload = {
       jobId,
-      customerId: 'user_mock_123', // MVP placeholder
+      customerId: user?.uid || 'user_mock_123',
       category: selectedService?.label || 'General',
       lat: userCoords[0],
       lng: userCoords[1],
@@ -159,16 +181,17 @@ export default function Dashboard() {
       paymentType: bookingPaymentType,
       amount: bookingAmount,
       photoUrl
-    });
+    };
+    
+    socket.emit('request_job', requestPayload);
+    setActiveJobRequest(requestPayload);
+    setReceivedOffers([]);
 
     setBookingSuccess(true);
     setTimeout(() => {
       setBookingSuccess(false);
-      setBookingWorker(null);
       setBookingDescription('');
-      setBookingDuration('');
       setBookingAmount('');
-      setBookingPaymentType('hourly');
       setBookingPhotoFile(null);
       setBookingPhotoPreview(null);
       setSelectedService(null);
@@ -201,13 +224,140 @@ export default function Dashboard() {
     );
   }, []);
 
-  /* WebSocket live workers */
+  /* WebSocket Setup */
   useEffect(() => {
     socket.connect();
+    
+    if (user?.uid) {
+      socket.emit('join_customer_room', user.uid);
+    } else {
+      socket.emit('join_customer_room', 'user_mock_123'); // fallback mock
+    }
+
     socket.emit('request_active_labours');
     socket.on('active_labours_updated', setLiveWorkers);
-    return () => socket.off('active_labours_updated');
-  }, []);
+    
+    socket.on('receive_offer', (offer) => {
+      setReceivedOffers(prev => [...prev, offer]);
+    });
+
+    socket.on('job_accepted', async (data) => {
+      setActiveJobRequest(null);
+      setActiveJob({ ...data, status: 'accepted' });
+      socket.emit('join_job_room', data.jobId);
+      
+      try {
+        const res = await fetch(`/api/chat/messages/${data.jobId}`);
+        const json = await res.json();
+        if (json.success) setChatMessages(json.messages);
+      } catch (err) {}
+    });
+
+    socket.on('job_status_updated', (data) => {
+      setActiveJob(prev => prev ? { ...prev, status: data.status } : null);
+      if (data.status === 'completed') {
+        setWorkerLocation(null);
+        setPaymentModalOpen(true);
+      }
+    });
+
+    socket.on('receive_message', (data) => {
+      setChatMessages((prev) => [...prev, data]);
+    });
+
+    socket.on('worker_location_update', (data) => {
+      setWorkerLocation([data.lat, data.lng]);
+    });
+
+    return () => {
+      socket.off('active_labours_updated');
+      socket.off('receive_offer');
+      socket.off('job_accepted');
+      socket.off('job_status_updated');
+      socket.off('receive_message');
+      socket.off('worker_location_update');
+    };
+  }, [user]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages, chatOpen]);
+
+  const sendChatMessage = (e) => {
+    e.preventDefault();
+    if (!chatInput.trim() || !activeJob) return;
+    socket.emit('send_message', {
+      jobId: activeJob.jobId,
+      senderId: user?.uid || 'user_mock_123',
+      senderName: profileData.name,
+      textContent: chatInput
+    });
+    setChatInput('');
+  };
+  
+  const handlePayment = async () => {
+    if (!activeJob) return;
+    setIsProcessingPayment(true);
+    try {
+      const res = await fetch('/api/payments/create-order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ amount: activeJob.amount, jobId: activeJob.jobId })
+      });
+      const orderData = await res.json();
+      
+      if (!orderData.success) {
+        alert('Could not initiate payment');
+        setIsProcessingPayment(false);
+        return;
+      }
+
+      const cashfree = window.Cashfree({ mode: "sandbox" });
+      
+      cashfree.checkout({
+        paymentSessionId: orderData.payment_session_id
+      }).then(async (result) => {
+        if(result.error){
+            alert(result.error.message);
+            setIsProcessingPayment(false);
+        }
+        if(result.paymentDetails){
+            try {
+               await fetch('/api/payments/verify', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ order_id: orderData.order_id })
+               });
+               setPaymentModalOpen(false);
+               setReviewModalOpen(true);
+            } catch(err) {
+               alert('Payment verification failed');
+            }
+        }
+      });
+    } catch (err) {
+      console.error(err);
+      alert('Error processing payment');
+      setIsProcessingPayment(false);
+    }
+  };
+
+  const submitReview = async () => {
+    if (!activeJob) return;
+    try {
+      await fetch(`/api/jobs/${activeJob.jobId}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rating: reviewRating, review: reviewText, labourId: activeJob.labourId })
+      });
+      setReviewModalOpen(false);
+      setActiveJob(null);
+    } catch (err) {
+      console.error(err);
+      setReviewModalOpen(false);
+      setActiveJob(null);
+    }
+  };
 
   const handleServiceClick = (svc) => setSelectedService(svc);
   const closeServiceModal = () => setSelectedService(null);
@@ -289,6 +439,174 @@ export default function Dashboard() {
 
         {activeTab === 'home' && (
           <>
+            {activeJob ? (
+              <div style={{ padding: '24px 16px' }}>
+                <h2 style={{ fontSize: 24, fontWeight: 800, margin: '0 0 16px' }}>Active Order</h2>
+
+                {/* Worker Contact Card */}
+                <div style={{ background: 'linear-gradient(135deg, #111827, #1e293b)', borderRadius: 20, padding: '20px', marginBottom: 16, boxShadow: '0 8px 24px rgba(0,0,0,0.15)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+                    <div style={{ width: 52, height: 52, borderRadius: '50%', background: 'linear-gradient(135deg, #22c55e, #16a34a)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontWeight: 800, fontSize: 20, flexShrink: 0, boxShadow: '0 4px 12px rgba(34,197,94,0.4)' }}>
+                      {(activeJob.labourName || 'W').charAt(0).toUpperCase()}
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <p style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#fff' }}>{activeJob.labourName || 'Worker'}</p>
+                      <p style={{ margin: '2px 0 0', fontSize: 12, color: '#94a3b8', fontWeight: 600 }}>
+                        {activeJob.status === 'accepted' ? '📍 Assigned to your job' : activeJob.status === 'en_route' ? '🚗 On the way to you' : '🔧 Working at your location'}
+                      </p>
+                    </div>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      {activeJob.labourPhone && (
+                        <a href={`tel:${activeJob.labourPhone}`} style={{ background: '#22c55e', color: '#fff', border: 'none', borderRadius: '50%', width: 42, height: 42, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', boxShadow: '0 2px 8px rgba(34,197,94,0.4)', textDecoration: 'none' }}>
+                          <Phone size={18} />
+                        </a>
+                      )}
+                      <button onClick={() => setChatOpen(true)} style={{ background: '#3b82f6', color: '#fff', border: 'none', borderRadius: '50%', width: 42, height: 42, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', boxShadow: '0 2px 8px rgba(59,130,246,0.4)' }}>
+                        <MessageSquare size={18} />
+                      </button>
+                    </div>
+                  </div>
+                  {activeJob.labourPhone && (
+                    <div style={{ marginTop: 12, padding: '8px 12px', background: 'rgba(255,255,255,0.08)', borderRadius: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <Phone size={14} color="#94a3b8" />
+                      <span style={{ color: '#e2e8f0', fontSize: 13, fontWeight: 600 }}>{activeJob.labourPhone}</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Live Tracking Map */}
+                {(activeJob.status === 'en_route' || activeJob.status === 'accepted') && (
+                  <div style={{ borderRadius: 20, overflow: 'hidden', marginBottom: 16, boxShadow: '0 4px 16px rgba(0,0,0,0.1)', border: '2px solid #e2e8f0' }}>
+                    <div style={{ background: '#f0fdf4', padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 8, borderBottom: '1px solid #e2e8f0' }}>
+                      <Navigation size={16} color="#16a34a" />
+                      <span style={{ fontSize: 13, fontWeight: 700, color: '#16a34a' }}>
+                        {activeJob.status === 'en_route' ? 'Tracking Worker Live' : 'Worker Location'}
+                      </span>
+                      {activeJob.status === 'en_route' && (
+                        <span style={{ marginLeft: 'auto', width: 8, height: 8, borderRadius: '50%', background: '#22c55e', animation: 'pulse 1.5s infinite' }} />
+                      )}
+                    </div>
+                    <style>{`@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }`}</style>
+                    <div style={{ height: 200, zIndex: 0 }}>
+                      <MapContainer center={workerLocation || userCoords} zoom={14} style={{ width: '100%', height: '100%', zIndex: 0 }} zoomControl={false} attributionControl={false}>
+                        <ChangeView center={workerLocation || userCoords} />
+                        <TileLayer url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png" />
+                        <Marker position={userCoords} icon={userIcon}>
+                          <Popup>Your Location</Popup>
+                        </Marker>
+                        {workerLocation && (
+                          <Marker position={workerLocation} icon={workerIcon}>
+                            <Popup>{activeJob.labourName || 'Worker'}</Popup>
+                          </Marker>
+                        )}
+                      </MapContainer>
+                    </div>
+                  </div>
+                )}
+
+                {/* Status + Price Card */}
+                <div style={{ background: '#fff', borderRadius: 16, padding: '20px', boxShadow: '0 4px 16px rgba(0,0,0,0.08)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                    <div>
+                      <p style={{ margin: 0, fontSize: 13, color: '#888', fontWeight: 600 }}>Job #{activeJob.jobId}</p>
+                    </div>
+                  </div>
+                  <div style={{ background: '#f5f5f5', borderRadius: 12, padding: 12, display: 'flex', gap: 10, marginBottom: 20 }}>
+                    <div style={{ flex: 1, textAlign: 'center' }}>
+                      <p style={{ margin: 0, fontSize: 12, color: '#888' }}>Agreed Price</p>
+                      <p style={{ margin: '2px 0 0', fontSize: 16, fontWeight: 800, color: '#16a34a' }}>₹{activeJob.amount}</p>
+                    </div>
+                    <div style={{ width: 1, background: '#ddd' }} />
+                    <div style={{ flex: 1, textAlign: 'center' }}>
+                      <p style={{ margin: 0, fontSize: 12, color: '#888' }}>Status</p>
+                      <p style={{ margin: '2px 0 0', fontSize: 14, fontWeight: 800, color: '#333' }}>
+                        {activeJob.status === 'accepted' ? 'Worker Assigned' : activeJob.status === 'en_route' ? 'Worker En Route' : 'Job In Progress'}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Status Timeline */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 0, marginBottom: 16 }}>
+                    {[
+                      { key: 'accepted', label: 'Worker Assigned', emoji: '✅', desc: 'Your worker has been confirmed' },
+                      { key: 'en_route', label: 'On The Way', emoji: '🚗', desc: 'Worker is heading to your location' },
+                      { key: 'in_progress', label: 'Work Started', emoji: '🔧', desc: 'Worker arrived and started the job' },
+                      { key: 'completed', label: 'Completed', emoji: '🎉', desc: 'Job finished!' }
+                    ].map((step, idx, arr) => {
+                      const statusOrder = ['accepted', 'en_route', 'in_progress', 'completed'];
+                      const currentIdx = statusOrder.indexOf(activeJob.status);
+                      const stepIdx = statusOrder.indexOf(step.key);
+                      const isDone = stepIdx <= currentIdx;
+                      const isCurrent = stepIdx === currentIdx;
+                      return (
+                        <div key={step.key} style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                            <div style={{ width: 28, height: 28, borderRadius: '50%', background: isDone ? '#16a34a' : '#e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, border: isCurrent ? '2px solid #16a34a' : 'none', boxShadow: isCurrent ? '0 0 0 4px rgba(34,197,94,0.15)' : 'none' }}>
+                              {isDone ? <span style={{ color: '#fff', fontSize: 14 }}>✓</span> : <span style={{ color: '#94a3b8', fontSize: 12 }}>{idx + 1}</span>}
+                            </div>
+                            {idx < arr.length - 1 && (
+                              <div style={{ width: 2, height: 24, background: isDone ? '#16a34a' : '#e2e8f0', margin: '2px 0' }} />
+                            )}
+                          </div>
+                          <div style={{ paddingBottom: idx < arr.length - 1 ? 8 : 0 }}>
+                            <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: isDone ? '#111' : '#94a3b8' }}>{step.emoji} {step.label}</p>
+                            {isCurrent && <p style={{ margin: '2px 0 0', fontSize: 11, color: '#888' }}>{step.desc}</p>}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {activeJob.status === 'en_route' && (
+                    <div style={{ background: '#e0f2fe', color: '#0369a1', padding: 12, borderRadius: 8, fontSize: 13, fontWeight: 700, textAlign: 'center' }}>
+                       🚗 The worker is on their way to your location!
+                    </div>
+                  )}
+                  {activeJob.status === 'in_progress' && (
+                    <div style={{ background: '#fef3c7', color: '#b45309', padding: 12, borderRadius: 8, fontSize: 13, fontWeight: 700, textAlign: 'center' }}>
+                       🔧 The worker has arrived and started the job.
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : activeJobRequest ? (
+              <div style={{ padding: '24px 16px' }}>
+                <h2 style={{ fontSize: 24, fontWeight: 800, margin: '0 0 16px' }}>Finding Workers...</h2>
+                <div style={{ background: '#fff', borderRadius: 16, padding: '20px', boxShadow: '0 4px 16px rgba(0,0,0,0.08)' }}>
+                   <div style={{ textAlign: 'center', marginBottom: 20 }}>
+                      <div className="spinner" style={{ border: '4px solid #f3f3f3', borderTop: '4px solid #16a34a', borderRadius: '50%', width: 40, height: 40, animation: 'spin 1s linear infinite', margin: '0 auto 10px' }} />
+                      <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
+                      <p style={{ color: '#555', fontSize: 14, fontWeight: 600 }}>Waiting for nearby workers to respond...</p>
+                   </div>
+                   
+                   {receivedOffers.length > 0 && (
+                     <div>
+                       <h4 style={{ margin: '0 0 12px', fontSize: 16, fontWeight: 800, color: '#111' }}>Offers Received ({receivedOffers.length})</h4>
+                       <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                         {receivedOffers.map((offer, i) => (
+                           <div key={i} style={{ background: '#f8fafc', padding: 16, borderRadius: 12, border: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                             <div>
+                               <p style={{ margin: 0, fontWeight: 800, fontSize: 15 }}>{offer.labourName}</p>
+                               <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 4 }}>
+                                 <Star size={12} color="#f59e0b" fill="#f59e0b" />
+                                 <span style={{ fontSize: 12, fontWeight: 600, color: '#555' }}>{offer.rating}</span>
+                               </div>
+                             </div>
+                             <div style={{ textAlign: 'right' }}>
+                               <p style={{ margin: '0 0 4px', fontWeight: 800, color: '#16a34a', fontSize: 16 }}>₹{offer.proposedAmount}</p>
+                               <button onClick={() => socket.emit('accept_offer', { ...offer, customerId: user?.uid || 'user_mock_123', customerName: profileData.name, customerPhone: profileData.phone, customerAddress: profileData.address, customerLat: userCoords[0], customerLng: userCoords[1] })} style={{ background: '#16a34a', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: 6, fontWeight: 700, fontSize: 12, cursor: 'pointer' }}>
+                                 Accept
+                               </button>
+                             </div>
+                           </div>
+                         ))}
+                       </div>
+                     </div>
+                   )}
+                </div>
+              </div>
+            ) : (
+              <>
             {/* Search */}
             <div style={{ padding: '14px 16px 0' }}>
               <div
@@ -526,36 +844,38 @@ export default function Dashboard() {
             </div>
           </>
         )}
+      </>
+    )}
 
-        {activeTab === 'orders' && (
-          <div style={{ padding: '24px 16px' }}>
-            <h2 style={{ fontSize: 24, fontWeight: 800, color: '#111', margin: '0 0 20px' }}>Your Bookings</h2>
-            
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-              {[1, 2].map(num => (
-                <div key={num} style={{ background: '#fff', borderRadius: 16, padding: '16px', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
-                    <div>
-                      <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700 }}>{num === 1 ? 'Emergency Plumber' : 'House Cleaning'}</h3>
-                      <p style={{ margin: '4px 0 0', fontSize: 13, color: '#888' }}>{num === 1 ? 'Oct 14, 2:30 PM' : 'Oct 10, 10:00 AM'}</p>
-                    </div>
-                    <span style={{ background: num === 1 ? '#dcfce7' : '#f3f4f6', color: num === 1 ? '#16a34a' : '#6b7280', padding: '4px 10px', borderRadius: 20, fontSize: 12, fontWeight: 700, height: 'fit-content' }}>
-                      {num === 1 ? 'Completed' : 'Cancelled'}
-                    </span>
-                  </div>
-                  
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, paddingTop: 12, borderTop: '1px solid #f0f0f0' }}>
-                    <div style={{ width: 32, height: 32, borderRadius: '50%', background: '#eee', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700 }}>
-                      {num === 1 ? 'RK' : 'AD'}
-                    </div>
-                    <span style={{ fontSize: 14, fontWeight: 600 }}>{num === 1 ? 'Ramesh Kumar' : 'Anita Devi'}</span>
-                    <span style={{ marginLeft: 'auto', fontWeight: 800 }}>₹{num === 1 ? '400' : '150'}</span>
-                  </div>
+    {activeTab === 'orders' && (
+      <div style={{ padding: '24px 16px' }}>
+        <h2 style={{ fontSize: 24, fontWeight: 800, color: '#111', margin: '0 0 20px' }}>Your Bookings</h2>
+        
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          {[1, 2].map(num => (
+            <div key={num} style={{ background: '#fff', borderRadius: 16, padding: '16px', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
+                <div>
+                  <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700 }}>{num === 1 ? 'Emergency Plumber' : 'House Cleaning'}</h3>
+                  <p style={{ margin: '4px 0 0', fontSize: 13, color: '#888' }}>{num === 1 ? 'Oct 14, 2:30 PM' : 'Oct 10, 10:00 AM'}</p>
                 </div>
-              ))}
+                <span style={{ background: num === 1 ? '#dcfce7' : '#f3f4f6', color: num === 1 ? '#16a34a' : '#6b7280', padding: '4px 10px', borderRadius: 20, fontSize: 12, fontWeight: 700, height: 'fit-content' }}>
+                  {num === 1 ? 'Completed' : 'Cancelled'}
+                </span>
+              </div>
+              
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, paddingTop: 12, borderTop: '1px solid #f0f0f0' }}>
+                <div style={{ width: 32, height: 32, borderRadius: '50%', background: '#eee', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700 }}>
+                  {num === 1 ? 'RK' : 'AD'}
+                </div>
+                <span style={{ fontSize: 14, fontWeight: 600 }}>{num === 1 ? 'Ramesh Kumar' : 'Anita Devi'}</span>
+                <span style={{ marginLeft: 'auto', fontWeight: 800 }}>₹{num === 1 ? '400' : '150'}</span>
+              </div>
             </div>
-          </div>
-        )}
+          ))}
+        </div>
+      </div>
+    )}
 
         {activeTab === 'profile' && (
           <div style={{ padding: '24px 16px' }}>
@@ -568,44 +888,79 @@ export default function Dashboard() {
                 {isEditingProfile ? 'Save' : 'Edit'}
               </button>
             </div>
+            
             <div style={{ background: '#fff', borderRadius: 20, padding: '24px', boxShadow: '0 2px 8px rgba(0,0,0,0.06)', display: 'flex', flexDirection: 'column', alignItems: 'center', marginBottom: 24 }}>
-              <div style={{ width: 80, height: 80, borderRadius: '50%', background: 'linear-gradient(130deg, #3b82f6, #60a5fa)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 28, fontWeight: 800, marginBottom: 12 }}>
-                {profileData.name.charAt(0).toUpperCase()}
+              <div style={{ position: 'relative', marginBottom: 12 }}>
+                <input 
+                  type="file" 
+                  accept="image/*" 
+                  id="customerProfilePicInput"
+                  disabled={!isEditingProfile}
+                  onChange={e => {
+                    if (e.target.files?.[0]) {
+                      setProfileData({...profileData, profilePic: URL.createObjectURL(e.target.files[0])});
+                    }
+                  }} 
+                  style={{ display: 'none' }}
+                />
+                <label htmlFor="customerProfilePicInput" style={{ cursor: isEditingProfile ? 'pointer' : 'default' }}>
+                  <div style={{ width: 80, height: 80, borderRadius: '50%', background: 'linear-gradient(130deg, #3b82f6, #60a5fa)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 28, fontWeight: 800, overflow: 'hidden', boxShadow: '0 4px 14px rgba(59,130,246,0.3)' }}>
+                    {profileData.profilePic ? (
+                      <img src={profileData.profilePic} alt="Profile" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    ) : (
+                      (profileData.name || 'C').charAt(0).toUpperCase()
+                    )}
+                  </div>
+                  {isEditingProfile && (
+                    <div style={{ position: 'absolute', bottom: 0, right: 0, background: '#111', borderRadius: '50%', padding: '6px', border: '2px solid #fff', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <User size={12} color="#fff" />
+                    </div>
+                  )}
+                </label>
               </div>
-              
+
               {isEditingProfile ? (
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', width: '100%', gap: 8 }}>
-                  <input 
-                    type="text" 
-                    value={profileData.name} 
-                    onChange={e => setProfileData({...profileData, name: e.target.value})} 
-                    style={{ textAlign: 'center', fontSize: 18, fontWeight: 700, border: '1px solid #ddd', borderRadius: 8, padding: '6px', width: '80%', outline: 'none' }}
-                  />
-                  <input 
-                    type="tel" 
-                    value={profileData.phone} 
-                    onChange={e => setProfileData({...profileData, phone: e.target.value})} 
-                    style={{ textAlign: 'center', fontSize: 14, color: '#555', border: '1px solid #ddd', borderRadius: 8, padding: '6px', width: '80%', outline: 'none' }}
-                  />
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', width: '100%', gap: 10 }}>
+                  <input type="text" value={profileData.name} onChange={e => setProfileData({...profileData, name: e.target.value})} placeholder="Full Name" style={{ textAlign: 'center', fontSize: 18, fontWeight: 700, border: '1px solid #ddd', borderRadius: 8, padding: '8px', width: '100%', outline: 'none' }} />
+                  <input type="email" value={profileData.email} onChange={e => setProfileData({...profileData, email: e.target.value})} placeholder="Email" style={{ textAlign: 'center', fontSize: 14, border: '1px solid #ddd', borderRadius: 8, padding: '8px', width: '100%', outline: 'none' }} />
+                  <input type="tel" value={profileData.phone} onChange={e => setProfileData({...profileData, phone: e.target.value})} placeholder="Phone Number" style={{ textAlign: 'center', fontSize: 14, border: '1px solid #ddd', borderRadius: 8, padding: '8px', width: '100%', outline: 'none' }} />
+                  <textarea value={profileData.address} onChange={e => setProfileData({...profileData, address: e.target.value})} placeholder="Address" style={{ textAlign: 'center', fontSize: 14, border: '1px solid #ddd', borderRadius: 8, padding: '8px', width: '100%', outline: 'none', resize: 'none' }} />
                 </div>
               ) : (
                 <>
                   <h3 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: '#111' }}>{profileData.name}</h3>
-                  <p style={{ margin: '4px 0 0', fontSize: 14, color: '#888', fontWeight: 500 }}>{profileData.phone}</p>
+                  <p style={{ margin: '4px 0 0', fontSize: 14, color: '#888', fontWeight: 500 }}>Customer</p>
+                  
+                  <div style={{ marginTop: 24, width: '100%', display: 'flex', flexDirection: 'column', gap: 12 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid #eee', paddingBottom: 8 }}>
+                      <span style={{ color: '#888', fontSize: 13 }}>Phone</span>
+                      <span style={{ color: '#111', fontSize: 13, fontWeight: 600 }}>{profileData.phone}</span>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid #eee', paddingBottom: 8 }}>
+                      <span style={{ color: '#888', fontSize: 13 }}>Email</span>
+                      <span style={{ color: '#111', fontSize: 13, fontWeight: 600 }}>{profileData.email}</span>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <span style={{ color: '#888', fontSize: 13 }}>Primary Address</span>
+                      <span style={{ color: '#111', fontSize: 13, fontWeight: 600, lineHeight: 1.4 }}>{profileData.address}</span>
+                    </div>
+                  </div>
                 </>
               )}
             </div>
 
             <div style={{ background: '#fff', borderRadius: 20, overflow: 'hidden', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
               {[
-                { icon: User, label: 'Edit Profile' },
+                { icon: User, label: 'Personal Information' },
                 { icon: Home, label: 'Manage Addresses' },
-                { icon: Settings, label: 'Settings' }
+                { icon: Settings, label: 'Account Settings' },
+                { icon: PowerOff, label: 'Log Out', color: '#dc2626', action: logout }
               ].map((item, i, arr) => {
                 const Icon = item.icon;
                 return (
                   <button
                     key={item.label}
+                    onClick={item.action}
                     style={{
                       width: '100%',
                       background: 'none',
@@ -618,9 +973,9 @@ export default function Dashboard() {
                       cursor: 'pointer'
                     }}
                   >
-                    <Icon size={22} color="#555" />
-                    <span style={{ fontSize: 15, fontWeight: 600, color: '#333' }}>{item.label}</span>
-                    <ChevronRight size={18} color="#ccc" style={{ marginLeft: 'auto' }} />
+                    <Icon size={22} color={item.color || '#555'} />
+                    <span style={{ fontSize: 15, fontWeight: 600, color: item.color || '#333' }}>{item.label}</span>
+                    {item.label !== 'Log Out' && <ChevronRight size={18} color="#ccc" style={{ marginLeft: 'auto' }} />}
                   </button>
                 )
               })}
@@ -1062,6 +1417,113 @@ export default function Dashboard() {
               </form>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Payment Modal */}
+      {paymentModalOpen && activeJob && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+          <div style={{ background: '#fff', padding: 24, borderRadius: 20, width: '100%', maxWidth: 400, boxShadow: '0 8px 32px rgba(0,0,0,0.1)' }}>
+            <div style={{ textAlign: 'center', marginBottom: 20 }}>
+              <div style={{ width: 64, height: 64, borderRadius: '50%', background: '#f0fdf4', color: '#16a34a', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 12px' }}>
+                <CheckCircle size={32} />
+              </div>
+              <h3 style={{ margin: 0, fontSize: 20, fontWeight: 800 }}>Job Completed!</h3>
+              <p style={{ margin: '4px 0 0', color: '#555', fontSize: 14 }}>Please complete your payment of <strong style={{ color: '#16a34a' }}>₹{activeJob.amount}</strong> to the worker.</p>
+            </div>
+            <button
+               onClick={handlePayment}
+               disabled={isProcessingPayment}
+               style={{ width: '100%', background: isProcessingPayment ? '#e2e8f0' : '#16a34a', color: isProcessingPayment ? '#94a3b8' : '#fff', border: 'none', padding: 14, borderRadius: 12, fontWeight: 800, fontSize: 16, cursor: isProcessingPayment ? 'not-allowed' : 'pointer' }}
+            >
+               {isProcessingPayment ? 'Processing...' : 'Pay via Cashfree'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Review Modal */}
+      {reviewModalOpen && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+          <div style={{ background: '#fff', padding: 24, borderRadius: 20, width: '100%', maxWidth: 400, boxShadow: '0 8px 32px rgba(0,0,0,0.1)' }}>
+            <div style={{ textAlign: 'center', marginBottom: 20 }}>
+              <div style={{ width: 64, height: 64, borderRadius: '50%', background: '#f0fdf4', color: '#16a34a', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 12px' }}>
+                <CheckCircle size={32} />
+              </div>
+              <h3 style={{ margin: 0, fontSize: 20, fontWeight: 800 }}>Job Completed!</h3>
+              <p style={{ margin: '4px 0 0', color: '#555', fontSize: 14 }}>Please rate your experience with the worker.</p>
+            </div>
+            
+            <div style={{ display: 'flex', justifyContent: 'center', gap: 8, marginBottom: 20 }}>
+              {[1, 2, 3, 4, 5].map(star => (
+                <button
+                  key={star}
+                  onClick={() => setReviewRating(star)}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+                >
+                  <Star size={32} color={star <= reviewRating ? '#f59e0b' : '#cbd5e1'} fill={star <= reviewRating ? '#f59e0b' : 'none'} />
+                </button>
+              ))}
+            </div>
+            
+            <textarea
+              placeholder="Leave a review (optional)..."
+              value={reviewText}
+              onChange={e => setReviewText(e.target.value)}
+              style={{ width: '100%', border: '1px solid #ddd', borderRadius: 12, padding: 12, minHeight: 80, fontSize: 14, outline: 'none', marginBottom: 20, resize: 'vertical' }}
+            />
+            
+            <button
+               onClick={submitReview}
+               style={{ width: '100%', background: '#16a34a', color: '#fff', border: 'none', padding: 14, borderRadius: 12, fontWeight: 800, fontSize: 16, cursor: 'pointer' }}
+            >
+               Submit Review
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Chat Mobile Overlay */}
+      {chatOpen && activeJob && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 1000, background: '#fff', display: 'flex', flexDirection: 'column' }}>
+          <header style={{ background: '#111', color: '#fff', padding: '16px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'sticky', top: 0 }}>
+            <div>
+              <p style={{ margin: 0, fontSize: 12, color: '#aaa', fontWeight: 600 }}>Chat securely (visible 24h)</p>
+              <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800 }}>Worker Chat</h3>
+            </div>
+            <button onClick={() => setChatOpen(false)} style={{ background: '#333', border: 'none', color: '#fff', padding: '6px 12px', borderRadius: 20, fontSize: 12, fontWeight: 700 }}>Close</button>
+          </header>
+          
+          <div style={{ flex: 1, overflowY: 'auto', padding: 16, background: '#f5f5f5', display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ textAlign: 'center', marginBottom: 10 }}>
+              <span style={{ fontSize: 11, background: '#ddd', padding: '2px 8px', borderRadius: 10, color: '#555' }}>Your number is hidden</span>
+            </div>
+            {chatMessages.map((msg, i) => {
+              const isMine = msg.senderId === (user?.uid || 'user_mock_123');
+              return (
+                <div key={i} style={{ alignSelf: isMine ? 'flex-end' : 'flex-start', maxWidth: '80%' }}>
+                  {!isMine && <span style={{ fontSize: 10, color: '#888', marginLeft: 4 }}>Worker</span>}
+                  <div style={{ background: isMine ? '#16a34a' : '#fff', color: isMine ? '#fff' : '#111', padding: '10px 14px', borderRadius: 16, borderBottomRightRadius: isMine ? 4 : 16, borderBottomLeftRadius: isMine ? 16 : 4, boxShadow: '0 1px 4px rgba(0,0,0,0.1)', fontSize: 14 }}>
+                    {msg.textContent}
+                  </div>
+                </div>
+              );
+            })}
+            <div ref={chatEndRef} />
+          </div>
+
+          <form onSubmit={sendChatMessage} style={{ padding: 12, background: '#fff', borderTop: '1px solid #eee', display: 'flex', gap: 8 }}>
+            <input 
+               type="text" 
+               placeholder="Type a message..." 
+               value={chatInput}
+               onChange={e => setChatInput(e.target.value)}
+               style={{ flex: 1, border: '1px solid #ddd', borderRadius: 24, padding: '12px 16px', fontSize: 14, outline: 'none' }}
+            />
+            <button type="submit" style={{ background: '#16a34a', color: '#fff', border: 'none', width: 44, height: 44, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+              <Send size={18} />
+            </button>
+          </form>
         </div>
       )}
     </div>

@@ -80,3 +80,15 @@ ALTER TABLE public.transactions ENABLE ROW LEVEL SECURITY;
 -- INSERT INTO storage.buckets (id, name, public) VALUES ('job_photos', 'job_photos', true) ON CONFLICT DO NOTHING;
 -- CREATE POLICY "Public Access" ON storage.objects FOR SELECT USING (bucket_id = 'job_photos');
 -- CREATE POLICY "Allow Uploads" ON storage.objects FOR INSERT WITH CHECK (bucket_id = 'job_photos');
+
+-- Create Messages Table for Chat
+CREATE TABLE public.messages (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  job_id UUID REFERENCES public.jobs(id) ON DELETE CASCADE,
+  sender_id TEXT REFERENCES public.users(id),
+  text_content TEXT NOT NULL
+);
+
+ALTER TABLE public.messages ENABLE ROW LEVEL SECURITY;
+

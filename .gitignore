@@ -26,3 +26,5 @@ encode.js
 *.njsproj
 *.sln
 *.sw?
+
+src/pages/oracleJdk-25/
